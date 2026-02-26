@@ -1,0 +1,14 @@
+[Unit]
+Description=polymaster-collector daemon
+After=network.target
+
+[Service]
+Type=simple
+User=neur0map
+ExecStart=/home/neur0map/.local/bin/collector run
+Restart=always
+RestartSec=30
+Environment=COLLECTOR_CONFIG=/home/neur0map/.config/polymaster-collector/config.toml
+
+[Install]
+WantedBy=multi-user.target

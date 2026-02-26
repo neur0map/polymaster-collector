@@ -1,0 +1,23 @@
+[general]
+db_path = "~/.config/polymaster-collector/collector.db"
+poll_interval_minutes = 5
+snapshot_interval_minutes = 15
+resolve_interval_minutes = 30
+backfill_interval_hours = 24  # auto-pull historical resolved markets daily
+
+[polymarket]
+enabled = true
+base_url = "https://clob.polymarket.com"
+gamma_url = "https://gamma-api.polymarket.com"
+
+[kalshi]
+enabled = true
+base_url = "https://api.elections.kalshi.com/trade-api/v2"
+
+[export]
+output_dir = "./exports"
+wwatcher_db_path = "~/.config/wwatcher/wwatcher.db"
+
+[news]
+enabled = false
+searxng_url = "http://localhost:8080"
