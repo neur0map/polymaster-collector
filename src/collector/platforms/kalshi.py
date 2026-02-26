@@ -34,15 +34,46 @@ class KalshiClient:
     # DISCOVER
     # ------------------------------------------------------------------
 
-    async def discover_markets(self) -> list[dict[str, Any]]:
-        """Return normalised market dicts for all open markets."""
-        raw = await self._fetch_all_markets(status="open")
-        return [self._normalise(m) for m in raw]
+    async def discover_markets(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return (market_dicts, snapshot_dicts) for all open markets.
 
-    async def _fetch_all_markets(self, status: str | None = None) -> list[dict]:
+        Kalshi includes prices inline, so we capture snapshots during discover.
+        """
+        raw = await self._fetch_all_markets(status="open")
+        markets = []
+        snapshots = []
+        for m in raw:
+            norm = self._normalise(m)
+            markets.append(norm)
+            # Build snapshot from normalised prices.
+            yes_bid = _cents_to_frac(m.get("yes_bid"))
+            yes_ask = _cents_to_frac(m.get("yes_ask"))
+            if yes_bid is not None and yes_ask is not None:
+                yes_price = (yes_bid + yes_ask) / 2
+            elif yes_bid is not None:
+                yes_price = yes_bid
+            else:
+                yes_price = yes_ask
+            if yes_price is not None:
+                no_price = 1.0 - yes_price
+                snapshots.append(dict(
+                    market_id=norm["market_id"],
+                    platform="kalshi",
+                    yes_price=yes_price,
+                    no_price=no_price,
+                    volume=_float(m.get("volume")),
+                    liquidity=_float(m.get("open_interest")),
+                    spread=abs(yes_price - no_price) if no_price is not None else None,
+                ))
+        return markets, snapshots
+
+    async def _fetch_all_markets(
+        self, status: str | None = None, *, max_pages: int = 50,
+    ) -> list[dict]:
         all_markets: list[dict] = []
         cursor: str | None = None
-        while True:
+        pages = 0
+        while pages < max_pages:
             params: dict[str, Any] = {"limit": _PAGE_LIMIT}
             if status:
                 params["status"] = status
@@ -55,9 +86,12 @@ class KalshiClient:
             batch = data.get("markets", [])
             all_markets.extend(batch)
             cursor = data.get("cursor")
+            pages += 1
             if not cursor or not batch:
                 break
-        log.info("Kalshi: discovered %d markets (status=%s)", len(all_markets), status)
+        if pages >= max_pages:
+            log.info("Kalshi: hit max_pages=%d cap at %d markets", max_pages, len(all_markets))
+        log.info("Kalshi: fetched %d markets (status=%s, pages=%d)", len(all_markets), status, pages)
         return all_markets
 
     def _normalise(self, m: dict) -> dict[str, Any]:
@@ -171,7 +205,7 @@ class KalshiClient:
 
     async def fetch_resolved_markets(self) -> list[dict[str, Any]]:
         """Fetch settled markets for backfill."""
-        raw = await self._fetch_all_markets(status="settled")
+        raw = await self._fetch_all_markets(status="settled", max_pages=200)
         results: list[dict] = []
         for m in raw:
             norm = self._normalise(m)

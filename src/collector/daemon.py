@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import time
 
 import aiosqlite
@@ -61,14 +62,16 @@ class Collector:
     # ------------------------------------------------------------------
 
     async def run_discover(self) -> int:
-        """DISCOVER phase — fetch and upsert active markets.  Returns count."""
+        """DISCOVER phase — fetch and upsert active markets + initial snapshots."""
         count = 0
+        snap_count = 0
         if self.poly:
             try:
-                markets = await self.poly.discover_markets()
+                markets, snapshots = await self.poly.discover_markets()
                 for m in markets:
                     await upsert_market(self.db, **m)
                 count += len(markets)
+                snap_count += await insert_snapshots_bulk(self.db, snapshots)
                 self._reset_backoff("poly_discover")
             except Exception:
                 log.error("DISCOVER polymarket failed", exc_info=True)
@@ -76,17 +79,18 @@ class Collector:
 
         if self.kalshi:
             try:
-                markets = await self.kalshi.discover_markets()
+                markets, snapshots = await self.kalshi.discover_markets()
                 for m in markets:
                     await upsert_market(self.db, **m)
                 count += len(markets)
+                snap_count += await insert_snapshots_bulk(self.db, snapshots)
                 self._reset_backoff("kalshi_discover")
             except Exception:
                 log.error("DISCOVER kalshi failed", exc_info=True)
                 await self._sleep_backoff("kalshi_discover")
 
         await self.db.commit()
-        log.info("DISCOVER complete: %d markets upserted", count)
+        log.info("DISCOVER complete: %d markets upserted, %d snapshots captured", count, snap_count)
         return count
 
     async def run_snapshot(self) -> int:
@@ -186,6 +190,14 @@ class Collector:
 # Main loop
 # ------------------------------------------------------------------
 
+def _human_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}PB"
+
+
 async def run_daemon(cfg: Config, db: aiosqlite.Connection) -> None:
     """Run the daemon forever (or until cancelled)."""
     collector = Collector(cfg, db)
@@ -203,6 +215,23 @@ async def run_daemon(cfg: Config, db: aiosqlite.Connection) -> None:
 
     try:
         while True:
+            # --- Storage guard: stop if disk is >=90% full ---
+            db_path = cfg.general.db_path
+            try:
+                usage = shutil.disk_usage(db_path if "/" in db_path else ".")
+                pct = usage.used / usage.total * 100
+                if pct >= 90.0:
+                    log.critical(
+                        "STORAGE GUARD: disk %.1f%% full (%s used / %s total). "
+                        "Stopping collector to prevent data loss.",
+                        pct,
+                        _human_bytes(usage.used),
+                        _human_bytes(usage.total),
+                    )
+                    break
+            except OSError:
+                pass  # can't stat — keep running
+
             now = time.monotonic()
 
             if now - last_discover >= poll:

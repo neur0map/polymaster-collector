@@ -81,6 +81,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(path))
     db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA busy_timeout=5000")
+    await db.execute("PRAGMA synchronous=NORMAL")
     await db.executescript(_SCHEMA_SQL)
     await db.execute(
         "INSERT OR IGNORE INTO _meta (key, value) VALUES (?, ?)",
@@ -88,6 +91,14 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     )
     await db.commit()
     log.info("Database ready: %s", path)
+    return db
+
+
+async def open_readonly(db_path: str) -> aiosqlite.Connection:
+    """Open database read-only — no schema writes, no lock contention."""
+    db = await aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA busy_timeout=10000")
     return db
 
 

@@ -35,15 +35,57 @@ class PolymarketClient:
     # DISCOVER — paginated fetch of all active markets
     # ------------------------------------------------------------------
 
-    async def discover_markets(self) -> list[dict[str, Any]]:
-        """Return normalised market dicts for upsertion."""
+    async def discover_markets(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return (market_dicts, snapshot_dicts) for upsertion.
+
+        Prices are captured from the discovery response so we don't need
+        individual per-market API calls for the initial snapshot.
+        """
         raw_markets = await self._fetch_all_markets()
-        return [self._normalise(m) for m in raw_markets]
+        markets = []
+        snapshots = []
+        for m in raw_markets:
+            markets.append(self._normalise(m))
+            snap = self._extract_snapshot(m)
+            if snap:
+                snapshots.append(snap)
+        return markets, snapshots
+
+    def _extract_snapshot(self, m: dict) -> dict[str, Any] | None:
+        """Extract a price snapshot from a raw Gamma API market object."""
+        outcome_prices = m.get("outcomePrices", "[]")
+        if isinstance(outcome_prices, str):
+            try:
+                outcome_prices = json.loads(outcome_prices)
+            except (json.JSONDecodeError, TypeError):
+                return None
+        if not outcome_prices:
+            return None
+        try:
+            yes_price = float(outcome_prices[0])
+            no_price = float(outcome_prices[1]) if len(outcome_prices) > 1 else None
+        except (ValueError, IndexError):
+            return None
+        spread = abs(yes_price - no_price) if yes_price is not None and no_price is not None else None
+        mid = str(m.get("conditionId") or m.get("id", ""))
+        if not mid:
+            return None
+        return dict(
+            market_id=mid,
+            platform="polymarket",
+            yes_price=yes_price,
+            no_price=no_price,
+            volume=_float(m.get("volume") or m.get("volumeNum")),
+            liquidity=_float(m.get("liquidity") or m.get("liquidityNum")),
+            spread=spread,
+        )
 
     async def _fetch_all_markets(self) -> list[dict]:
         all_markets: list[dict] = []
+        seen_ids: set[str] = set()
         offset = 0
-        while True:
+        max_offset = 5000  # safety cap — Polymarket has ~2-3k active markets
+        while offset <= max_offset:
             params = {
                 "limit": _PAGE_LIMIT,
                 "offset": offset,
@@ -57,11 +99,21 @@ class PolymarketClient:
             batch = resp.json()
             if not batch:
                 break
-            all_markets.extend(batch)
+            # Deduplicate — Gamma API can recycle results at high offsets.
+            new_count = 0
+            for m in batch:
+                cid = str(m.get("conditionId") or m.get("id", ""))
+                if cid and cid not in seen_ids:
+                    seen_ids.add(cid)
+                    all_markets.append(m)
+                    new_count += 1
+            if new_count == 0:
+                log.info("Polymarket: no new markets at offset %d, stopping", offset)
+                break
             if len(batch) < _PAGE_LIMIT:
                 break
             offset += _PAGE_LIMIT
-        log.info("Polymarket: discovered %d active markets", len(all_markets))
+        log.info("Polymarket: discovered %d unique active markets", len(all_markets))
         return all_markets
 
     def _normalise(self, m: dict) -> dict[str, Any]:
@@ -93,22 +145,30 @@ class PolymarketClient:
     # SNAPSHOT — current prices for a list of markets
     # ------------------------------------------------------------------
 
-    async def fetch_prices(self, markets: list[dict]) -> list[dict]:
-        """Return snapshot rows for the given markets."""
+    async def fetch_prices(self, markets: list[dict], *, max_markets: int = 200) -> list[dict]:
+        """Return snapshot rows for the given markets (capped to max_markets)."""
+        # Only refresh a subset per cycle — discover already captures initial prices.
+        subset = markets[:max_markets]
         snapshots: list[dict] = []
-        for mkt in markets:
-            mid = mkt["market_id"]
+        for mkt in subset:
+            slug = mkt.get("slug", "")
+            if not slug:
+                continue
             try:
                 await asyncio.sleep(_RATE_DELAY)
                 resp = await self._http.get(
-                    f"{self.gamma_url}/markets/{mid}"
+                    f"{self.gamma_url}/markets",
+                    params={"slug": slug, "limit": 1},
                 )
-                if resp.status_code == 404:
+                if resp.status_code in (404, 422):
                     continue
                 resp.raise_for_status()
-                data = resp.json()
+                data_list = resp.json()
+                if not data_list:
+                    continue
+                data = data_list[0] if isinstance(data_list, list) else data_list
             except Exception:
-                log.warning("Polymarket: price fetch failed for %s", mid, exc_info=True)
+                log.warning("Polymarket: price fetch failed for %s", slug, exc_info=True)
                 continue
 
             outcome_prices = data.get("outcomePrices", "[]")
@@ -123,7 +183,7 @@ class PolymarketClient:
             spread = abs(yes_price - no_price) if yes_price is not None and no_price is not None else None
 
             snapshots.append(dict(
-                market_id=mid,
+                market_id=mkt["market_id"],
                 platform="polymarket",
                 yes_price=yes_price,
                 no_price=no_price,
@@ -192,8 +252,10 @@ class PolymarketClient:
     async def fetch_resolved_markets(self) -> list[dict[str, Any]]:
         """Fetch historical resolved markets for backfill."""
         all_markets: list[dict] = []
+        seen_ids: set[str] = set()
         offset = 0
-        while True:
+        max_offset = 20000  # backfill can go deeper
+        while offset <= max_offset:
             params = {
                 "limit": _PAGE_LIMIT,
                 "offset": offset,
@@ -205,11 +267,20 @@ class PolymarketClient:
             batch = resp.json()
             if not batch:
                 break
-            all_markets.extend(batch)
+            new_count = 0
+            for m in batch:
+                cid = str(m.get("conditionId") or m.get("id", ""))
+                if cid and cid not in seen_ids:
+                    seen_ids.add(cid)
+                    all_markets.append(m)
+                    new_count += 1
+            if new_count == 0:
+                log.info("Polymarket: backfill no new markets at offset %d, stopping", offset)
+                break
             if len(batch) < _PAGE_LIMIT:
                 break
             offset += _PAGE_LIMIT
-        log.info("Polymarket: backfill fetched %d closed markets", len(all_markets))
+        log.info("Polymarket: backfill fetched %d unique closed markets", len(all_markets))
         return [self._normalise_resolved(m) for m in all_markets]
 
     def _normalise_resolved(self, m: dict) -> dict[str, Any]:

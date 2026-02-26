@@ -60,12 +60,12 @@ def run(ctx: click.Context) -> None:
 @click.pass_context
 def status(ctx: click.Context) -> None:
     """Show collection statistics."""
-    from collector.db import init_db, stats
+    from collector.db import open_readonly, stats
 
     cfg = ctx.obj["cfg"]
 
     async def _main() -> None:
-        db = await init_db(cfg.general.db_path)
+        db = await open_readonly(cfg.general.db_path)
         try:
             s = await stats(db)
             click.echo(f"Markets:    active={s['active']}  closed={s['closed']}  resolved={s['resolved']}")
@@ -135,12 +135,12 @@ def export(ctx: click.Context, fmt: str, category: str | None, platform: str | N
 @click.pass_context
 def categories(ctx: click.Context) -> None:
     """List all categories and their market counts."""
-    from collector.db import init_db
+    from collector.db import open_readonly
 
     cfg = ctx.obj["cfg"]
 
     async def _main() -> None:
-        db = await init_db(cfg.general.db_path)
+        db = await open_readonly(cfg.general.db_path)
         try:
             rows = await db.execute_fetchall(
                 "SELECT category, COUNT(*) as total, "
